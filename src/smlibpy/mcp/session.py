@@ -33,6 +33,7 @@ class Session:
         self.checkpoints: list[tuple[str, int]] = []
         self.version = 0  # grows whenever what the viewer shows may have changed
         self._changed = threading.Condition()
+        self.on_change: Any = None  # called after every change (zopu.py keeps the session on disk)
 
     # -- worker -------------------------------------------------------------------
     def _start(self) -> None:
@@ -148,6 +149,11 @@ class Session:
             self.checkpoints = [(k, n) for k, n in self.checkpoints if k != label]
             self.checkpoints.append((label, len(self.history)))
             self.checkpoints = self.checkpoints[-MAX_CHECKPOINTS:]
+            if self.on_change is not None:
+                try:
+                    self.on_change()
+                except Exception:
+                    pass
             return label
 
     def restore(self, label: str | None = None) -> str:
@@ -177,6 +183,11 @@ class Session:
         with self._changed:
             self.version += 1
             self._changed.notify_all()
+        if self.on_change is not None:
+            try:
+                self.on_change()
+            except Exception:
+                pass
 
     def wait_for_change(self, seen: int, timeout: float) -> int:
         with self._changed:

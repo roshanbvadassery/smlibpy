@@ -29,7 +29,7 @@ except ImportError:  # 1.x
     from mcp.server.fastmcp import FastMCP as MCPServer  # type: ignore[no-redef]
     from mcp.server.fastmcp import Image  # type: ignore[no-redef]
 
-from . import discovery
+from . import discovery, zopu
 from .live import LiveViewer
 from .session import DEFAULT_TIMEOUT, Session
 
@@ -124,8 +124,9 @@ GUIDES
 
 
 def instructions() -> str:
-    return _GUIDE.format(viewer=_VIEWER_NOTE[_mode()], methods=discovery.method_index(),
+    text = _GUIDE.format(viewer=_VIEWER_NOTE[_mode()], methods=discovery.method_index(),
                          guides=discovery.guide_index() or "(none yet)")
+    return text + zopu.GUIDE if zopu.enabled() else text
 
 
 def _snapshot_dir() -> str:
@@ -167,6 +168,10 @@ def build_server(session: Session | None = None) -> Any:
     import smlibpy
 
     session = session or Session()
+    z = zopu.Zopu(session) if zopu.enabled() else None
+    if z is not None:
+        session.on_change = z.save_state
+        z.restore_state()
     viewer = LiveViewer(session)
     mode = _mode()
     server = MCPServer(name="smlibpy", instructions=instructions())
@@ -184,6 +189,8 @@ def build_server(session: Session | None = None) -> Any:
 
     def viewer_note(scene: list[dict[str, Any]]) -> str | None:
         if viewer.opened or not scene or mode == "none":
+            return None
+        if z is not None:  # on Zopu the canvas is the viewer: a local link would only mislead
             return None
         viewer.opened = True
         link = viewer.url
@@ -224,6 +231,10 @@ def build_server(session: Session | None = None) -> Any:
         note = viewer_note(scene)
         if note:
             parts.append(note)
+        if z is not None:
+            published = await z.after_run()
+            if published:
+                parts.append(published)
         return "\n\n".join(parts)
 
     @tool()
@@ -476,6 +487,28 @@ def build_server(session: Session | None = None) -> Any:
             except Exception:
                 pass
         return f"Viewer: {link}"
+
+    if z is not None:
+        @tool()
+        async def publish(
+            project_id: Annotated[str | None, Field(description="The Zopu project to place the part on. Required "
+                                                    "the first time; later calls reuse the bound part's.")] = None,
+            name: Annotated[str | None, Field(description="Part name shown on the canvas, e.g. 'Mounting plate'.")] = None,
+            names: Annotated[list[str] | None, Field(description="Variables to publish instead of what is shown.")] = None,
+            shape_id: Annotated[str | None, Field(description="An existing cad_model shape to update instead of "
+                                                  "placing a new one.")] = None,
+        ) -> str:
+            """Put the model on the user's Zopu canvas: GLB, STEP, STL and a picture, as a live cad_model shape.
+            Binds the part: later successful scripts update the same shape."""
+            try:
+                return await z.publish(project_id, name, names, shape_id)
+            except Exception as e:
+                return f"Publish failed: {e}"
+
+        @tool()
+        async def unbind() -> str:
+            """Stop updating the published part after every script (before starting a different part)."""
+            return z.unbind()
 
     server._smlibpy_session = session  # type: ignore[attr-defined]
     server._smlibpy_viewer = viewer  # type: ignore[attr-defined]
