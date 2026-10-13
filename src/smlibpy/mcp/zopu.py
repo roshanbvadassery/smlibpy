@@ -3,8 +3,11 @@
 Active only when ``ZOPU_SERVICES_URL`` is set (the Zopu agent machine sets it); without it the
 server is exactly upstream smlibpy.
 
-- The session's scripts and checkpoints are kept in ``$SMLIBPY_STATE_DIR/session.json`` after
-  every change, and replayed when the server starts, so a model survives the machine sleeping.
+- Work is organised in *parts*: ``new_part`` starts a design with an empty session, ``open_part``
+  brings an earlier one back. Each part keeps its scripts and checkpoints in
+  ``$SMLIBPY_STATE_DIR/parts/<id>/session.json`` after every change; the open part is replayed
+  when the server starts, so a model survives the machine sleeping, and a new design never
+  inherits (or overwrites) the previous one.
 - ``publish`` writes GLB, STEP, STL and a PNG of what is shown, uploads them to Zopu storage
   (``$ZOPU_SERVICES_URL/store-file``) and places or updates a ``cad_model`` shape on the
   project canvas through the Zopu canvas MCP (``place_cad_model`` at ``$ZOPU_MCP_URL``).
@@ -18,7 +21,7 @@ Environment:
     ZOPU_WS                 the workspace; ``.session.json`` there holds the user id
     ZOPU_UID                the user id, instead of ``.session.json``
     SMLIBPY_STATE_DIR       where the session is kept (default: ~/.smlibpy/state)
-    SMLIBPY_FILES_DIR       where published files are written (default: <state dir>/../files)
+    SMLIBPY_FILES_DIR       where published files are written (default: <state dir>/../files/<part>)
     SMLIBPY_AUTOPUBLISH     ``0`` turns off publishing after every script
 """
 
@@ -37,6 +40,8 @@ from typing import Any
 from .session import Session
 
 STATE_FILE = "session.json"
+CURRENT_FILE = "current.json"
+STALE_AFTER_S = 30 * 60
 UPLOAD_TIMEOUT = 120.0
 PLACE_TIMEOUT = 60.0
 MCP_PROTOCOL = "2025-03-26"
@@ -73,50 +78,66 @@ class Zopu:
         self.mcp_token = os.environ.get("ZOPU_MCP_REFRESH_TOKEN", "").strip()
         self.state_dir = os.path.abspath(os.path.expanduser(
             os.environ.get("SMLIBPY_STATE_DIR") or os.path.join("~", ".smlibpy", "state")))
-        self.files_dir = os.path.abspath(os.path.expanduser(
+        self.files_root = os.path.abspath(os.path.expanduser(
             os.environ.get("SMLIBPY_FILES_DIR") or os.path.join(os.path.dirname(self.state_dir), "files")))
         self.autopublish = os.environ.get("SMLIBPY_AUTOPUBLISH", "1").strip() not in ("0", "false", "off")
-        self.bound: dict[str, Any] | None = None
+        self.part_id: str | None = None  # the open part (a directory under parts/)
+        self.bound: dict[str, Any] | None = None  # its metadata: project, name, shape, version, ...
+        self.notice: str | None = None  # told once, with the next tool answer
         self._io = threading.Lock()
         self._restoring = False
 
-    # -- persistence ------------------------------------------------------------------
+    # -- parts on disk ----------------------------------------------------------------
     @property
-    def _state_path(self) -> str:
-        return os.path.join(self.state_dir, STATE_FILE)
+    def parts_dir(self) -> str:
+        return os.path.join(self.state_dir, "parts")
+
+    def _part_file(self, part_id: str) -> str:
+        return os.path.join(self.parts_dir, part_id, STATE_FILE)
+
+    @property
+    def files_dir(self) -> str:
+        return os.path.join(self.files_root, self.part_id or "_scratch")
+
+    def _write_json(self, path: str, data: Any) -> None:
+        with self._io:
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                os.replace(tmp, path)
+            except OSError:
+                pass  # never break modeling over a state file
+
+    def _read_json(self, path: str) -> dict[str, Any]:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _set_current(self, part_id: str | None) -> None:
+        self.part_id = part_id
+        self._write_json(os.path.join(self.state_dir, CURRENT_FILE), {"part": part_id})
 
     def save_state(self) -> None:
-        """Called after every change of the session (Session.on_change)."""
-        if self._restoring:
+        """Called after every change of the session (Session.on_change): keeps the open part."""
+        if self._restoring or not self.part_id:
             return
-        data = {
+        if self.bound is not None:
+            self.bound["updated"] = time.time()
+        self._write_json(self._part_file(self.part_id), {
             "history": [{"code": c, "label": l} for c, l in self.session.history],
             "checkpoints": [{"label": k, "n": n} for k, n in self.session.checkpoints],
             "bound": self.bound,
             "saved": time.time(),
-        }
-        with self._io:
-            try:
-                os.makedirs(self.state_dir, exist_ok=True)
-                tmp = self._state_path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(data, f)
-                os.replace(tmp, self._state_path)
-            except OSError:
-                pass  # never break modeling over a state file
+        })
 
-    def restore_state(self) -> None:
-        """Replay the kept session in the background; tools wait on the session lock meanwhile."""
-        try:
-            with open(self._state_path, encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            return
-        self.bound = data.get("bound")
+    def _replay(self, data: dict[str, Any], background: bool) -> None:
         history = [(h["code"], h.get("label")) for h in data.get("history", []) if h.get("code")]
         checkpoints = [(c["label"], int(c["n"])) for c in data.get("checkpoints", [])]
-        if not history:
-            return
         ready = threading.Event()
 
         def replay() -> None:
@@ -124,16 +145,128 @@ class Zopu:
                 ready.set()
                 self._restoring = True
                 try:
-                    self.session.history = history
-                    self.session._rebuild()
+                    if history:
+                        self.session.history = history
+                        self.session._rebuild()
+                    else:
+                        self.session.clear()
                     n = len(self.session.history)
                     self.session.checkpoints = [(k, m) for k, m in checkpoints if m <= n]
                 finally:
                     self._restoring = False
             self.save_state()
 
-        threading.Thread(target=replay, name="smlibpy-restore", daemon=True).start()
-        ready.wait(5)  # the lock is held before the first tool call can take it
+        if background:
+            threading.Thread(target=replay, name="smlibpy-restore", daemon=True).start()
+            ready.wait(5)  # the lock is held before the first tool call can take it
+        else:
+            replay()
+
+    def _migrate_flat_state(self) -> None:
+        """Before parts existed the session lived in state/session.json: keep it as a closed part."""
+        old = os.path.join(self.state_dir, STATE_FILE)
+        data = self._read_json(old)
+        if not data:
+            return
+        if data.get("history") or data.get("bound"):
+            name = (data.get("bound") or {}).get("name") or "Earlier session"
+            part_id = f"{_slug(name)}-{uuid.uuid4().hex[:6]}"
+            self._write_json(self._part_file(part_id), data)
+        try:
+            os.replace(old, old + ".migrated")
+        except OSError:
+            pass
+
+    def restore_state(self) -> None:
+        """At start: reopen the part that was open (replayed in the background)."""
+        self._migrate_flat_state()
+        part_id = self._read_json(os.path.join(self.state_dir, CURRENT_FILE)).get("part")
+        if not part_id:
+            return
+        data = self._read_json(self._part_file(part_id))
+        if not data:
+            return
+        self.part_id = part_id
+        self.bound = data.get("bound")
+        b = self.bound or {}
+        age = time.time() - float(b.get("updated") or data.get("saved") or 0)
+        if age > STALE_AFTER_S:
+            shape = b.get("shape_id") or "not published"
+            self.notice = (f"Note: the session still holds part {b.get('name')!r} (shape {shape}, "
+                           f"v{b.get('version') or 0}, last edited {age / 60:.0f} min ago). For a different "
+                           "design call new_part first; to keep editing it, go on.")
+        self._replay(data, background=True)
+
+    def take_notice(self) -> str | None:
+        note, self.notice = self.notice, None
+        return note
+
+    # -- the part lifecycle -----------------------------------------------------------
+    def new_part(self, project_id: str, name: str) -> str:
+        if not project_id or not name:
+            raise ValueError("new_part needs project_id and name")
+        previous = self.bound
+        part_id = f"{_slug(name)}-{uuid.uuid4().hex[:6]}"
+        now = time.time()
+        self.bound = {"project_id": project_id, "name": name, "shape_id": None, "version": 0, "names": None,
+                      "plan_z": None, "created": now, "updated": now}
+        self._set_current(part_id)
+        self.session.clear()  # empty session; on_change writes the new part's state
+        self.save_state()
+        self.notice = None
+        text = f"New part {name!r} (project {project_id}): the session is empty."
+        if previous and previous.get("name"):
+            text += (f" The previous part {previous['name']!r} (shape {previous.get('shape_id') or '-'}) is kept: "
+                     "open_part brings it back.")
+        return text + " Model it, then publish() places it on the canvas."
+
+    def _all_parts(self) -> list[tuple[str, dict[str, Any]]]:
+        out = []
+        try:
+            ids = os.listdir(self.parts_dir)
+        except OSError:
+            return []
+        for pid in ids:
+            data = self._read_json(self._part_file(pid))
+            if data:
+                out.append((pid, data))
+        out.sort(key=lambda x: float((x[1].get("bound") or {}).get("updated") or x[1].get("saved") or 0), reverse=True)
+        return out
+
+    def list_parts(self) -> str:
+        parts = self._all_parts()
+        if not parts:
+            return "No parts yet: new_part(project_id, name) starts one."
+        rows = []
+        for pid, data in parts[:40]:
+            b = data.get("bound") or {}
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(b.get("updated") or data.get("saved") or 0)))
+            size = " × ".join(f"{v:g}" for v in (b.get("stats") or {}).get("bbox", [])) or "-"
+            rows.append(f"{'*' if pid == self.part_id else '-'} {b.get('name') or pid!r}: shape {b.get('shape_id') or '-'}"
+                        f", v{b.get('version') or 0}, project {b.get('project_id') or '-'}, {size} mm, "
+                        f"{len(data.get('history', []))} scripts, edited {when}")
+        return "Parts (* = open), newest first:\n" + "\n".join(rows)
+
+    def open_part(self, key: str) -> str:
+        key = (key or "").strip()
+        found = None
+        for pid, data in self._all_parts():
+            b = data.get("bound") or {}
+            if key in (pid, b.get("shape_id")) or key.lower() == str(b.get("name") or "").lower():
+                found = (pid, data)
+                break
+        if found is None:
+            raise KeyError(f"no part {key!r}. list_parts() shows them; for a part made elsewhere, new_part and "
+                           "rebuild it, then publish(shape_id=...) to update its shape.")
+        pid, data = found
+        self.save_state()
+        self.bound = data.get("bound")
+        self._set_current(pid)
+        self.notice = None
+        self._replay(data, background=False)
+        b = self.bound or {}
+        return (f"Opened part {b.get('name')!r} (shape {b.get('shape_id') or '-'}, v{b.get('version') or 0}): "
+                f"{len(self.session.history)} scripts replayed. Later successful scripts update its shape.")
 
     # -- publishing -------------------------------------------------------------------
     def _uid(self) -> str:
@@ -271,12 +404,19 @@ class Zopu:
                       plan_z: float | None = None) -> str:
         import anyio
 
-        b = dict(self.bound or {})
-        if project_id and project_id != b.get("project_id"):
-            b = {}  # another project: a new shape
+        if not self.part_id or not self.bound:
+            raise RuntimeError("no part is open: call new_part(project_id, name) first (or open_part to edit one)")
+        b = dict(self.bound)
+        held = f"this session holds part {b.get('name')!r}; call new_part for a new design, or open_part to edit another"
+        if project_id and b.get("project_id") and project_id != b["project_id"]:
+            raise RuntimeError(f"project {project_id} is not this part's project ({b['project_id']}): {held}")
+        if name and b.get("shape_id") and name != b.get("name"):
+            raise RuntimeError(f"name {name!r} differs from the published part: {held}")
+        if shape_id and b.get("shape_id") and shape_id != b["shape_id"]:
+            raise RuntimeError(f"shape {shape_id} is not this part's shape ({b['shape_id']}): {held}")
         project_id = project_id or b.get("project_id")
         if not project_id:
-            raise ValueError("project_id is required for the first publish")
+            raise ValueError("project_id is required")
         name = name or b.get("name") or "Part"
         names = names if names is not None else b.get("names")
         shape_id = shape_id or b.get("shape_id")
@@ -339,7 +479,7 @@ class Zopu:
         if m:
             version = int(m.group(1))
 
-        self.bound = {"project_id": project_id, "shape_id": shape_id, "name": name, "names": names,
+        self.bound = {**b, "project_id": project_id, "shape_id": shape_id, "name": name, "names": names,
                       "plan_z": plan_z, "version": version, "urls": urls, "stats": stats}
         self.save_state()
         size = " × ".join(f"{v:g}" for v in stats.get("bbox", [])) or "?"
@@ -349,11 +489,13 @@ class Zopu:
                 f"  STEP:   {urls.get('step', '')}\n  STL:    {urls.get('stl', '')}\n  GLB:    {urls['glb']}\n"
                 + (f"  PLAN:   {urls.get('plan_png', '')} (cut at z = {plan_z:g} mm)\n"
                    f"  DXF:    {urls.get('plan_dxf', '')}\n" if plan_z is not None else "")
-                + "Later successful scripts publish this part again automatically (unbind() to stop).")
+                + "Later successful scripts publish this part again automatically.")
 
     async def after_run(self) -> str | None:
         """After a successful script: publish the bound part again."""
-        if not (self.bound and self.autopublish):
+        if not (self.bound and self.bound.get("shape_id") and self.autopublish):
+            if not self.part_id:
+                return "No part open — call new_part(project_id, name) before publishing."
             return None
         try:
             text = await self.publish()
@@ -362,12 +504,15 @@ class Zopu:
             return f"Canvas update failed: {e}"
 
     def unbind(self) -> str:
+        """Close the open part: it stays on disk and on the canvas; scripts no longer update it."""
         was = self.bound
-        self.bound = None
         self.save_state()
+        self.bound = None
+        self._set_current(None)
         if not was:
-            return "No part was bound."
-        return f"Stopped publishing {was.get('name')!r} (shape {was.get('shape_id')}); it stays on the canvas."
+            return "No part was open."
+        return (f"Closed part {was.get('name')!r} (shape {was.get('shape_id') or '-'}); it stays on the canvas, "
+                "open_part brings it back.")
 
 
 VIEWER_NOTE = ("VIEWER: the user's Zopu canvas is the viewer. publish puts the model there and later scripts "
@@ -375,15 +520,17 @@ VIEWER_NOTE = ("VIEWER: the user's Zopu canvas is the viewer. publish puts the m
 
 
 GUIDE = """
-ZOPU CANVAS
-You work for a Zopu user; the part you build is the deliverable on their project canvas.
-- publish(project_id, name) exports what is shown (GLB, STEP, STL, a picture), uploads it and places a \
-cad_model shape on the canvas: a live 3D view with downloads. Publish once the first valid body exists.
-- After that every successful run_script publishes the part again (same shape, next version), so the \
-user watches it evolve. show(...) the deliverable so helpers and tools are left out.
-- Buildings and layouts: publish(..., plan_z=1200) also cuts a floor plan at that height (DXF + hatched plan \
-picture) shown on the same shape; later updates keep cutting it.
-- To change a part already on the canvas, pass its shape_id to publish. To start a different part, \
-unbind() first, then publish it under its own name.
-- The session is kept on disk: it survives the machine sleeping.
+ZOPU CANVAS — PARTS
+You work for a Zopu user; what you build is the deliverable on their project canvas.
+- EVERY new design starts with new_part(project_id, name): an empty session for that part. Never build a \
+new design on top of what the session holds.
+- To change a part made earlier (another conversation): list_parts(), then open_part(shape_id or name) \
+replays its scripts; then modify it.
+- publish() exports what is shown (GLB, STEP, STL, a picture), uploads it and places the part's cad_model \
+shape on the canvas. Publish once the first valid body exists. After that every successful run_script \
+publishes again (same shape, next version), so the user watches it evolve. show(...) the deliverable.
+- Buildings and layouts: publish(plan_z=1200) also cuts a floor plan at that height (DXF + hatched plan \
+picture) on the same shape; later updates keep cutting it.
+- publish refuses another project, name or shape than the open part's: that is a new part (new_part).
+- Parts are kept on disk: they survive the machine sleeping.
 """

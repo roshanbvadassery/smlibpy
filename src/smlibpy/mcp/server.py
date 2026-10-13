@@ -236,6 +236,9 @@ def build_server(session: Session | None = None) -> Any:
             published = await z.after_run()
             if published:
                 parts.append(published)
+            notice = z.take_notice()
+            if notice:
+                parts.insert(0, notice)
         return "\n\n".join(parts)
 
     @tool()
@@ -513,8 +516,38 @@ def build_server(session: Session | None = None) -> Any:
 
         @tool()
         async def unbind() -> str:
-            """Stop updating the published part after every script (before starting a different part)."""
+            """Close the open part: it stays on the canvas and on disk; scripts no longer update it."""
             return z.unbind()
+
+        @tool()
+        async def new_part(
+            project_id: Annotated[str, Field(description="The Zopu project the part belongs on.")],
+            name: Annotated[str, Field(description="Part name shown on the canvas, e.g. 'Mounting plate', "
+                                       "'2BHK floor plan'.")],
+        ) -> str:
+            """Start a new design: an empty session for a new part (the previous part is kept). Call this
+            FIRST for every new design, before any script."""
+            try:
+                return await call(z.new_part, project_id, name)
+            except Exception as e:
+                return f"new_part failed: {e}"
+
+        @tool()
+        async def open_part(
+            key: Annotated[str, Field(description="The part's cad_model shape id (shape:...), its name, or its id "
+                                      "from list_parts.")],
+        ) -> str:
+            """Reopen a part made earlier: its scripts run again and later scripts update its canvas shape.
+            Use it to edit an existing part."""
+            try:
+                return await call(z.open_part, key)
+            except Exception as e:
+                return f"open_part failed: {e.args[0] if e.args else e}"
+
+        @tool()
+        async def list_parts() -> str:
+            """The parts kept on this machine (newest first): name, canvas shape, version, project, size."""
+            return z.list_parts()
 
     server._smlibpy_session = session  # type: ignore[attr-defined]
     server._smlibpy_viewer = viewer  # type: ignore[attr-defined]
