@@ -45,12 +45,17 @@ STALE_AFTER_S = 30 * 60
 UPLOAD_TIMEOUT = 120.0
 PLACE_TIMEOUT = 60.0
 MCP_PROTOCOL = "2025-03-26"
+# urllib's default "Python-urllib/x.y" is blocked outright by Cloudflare's browser-signature
+# check (403, error 1010) on zones in front of Zopu services: always identify ourselves.
+USER_AGENT = os.environ.get("ZOPU_HTTP_USER_AGENT") or "smlibpy-zopu/0.2 (+https://zopu.ai)"
 MIME = {".glb": "model/gltf-binary", ".step": "model/step", ".stl": "model/stl", ".png": "image/png",
         ".dxf": "image/vnd.dxf"}
 
 
 def _send(req: urllib.request.Request, timeout: float, with_headers: bool = False) -> Any:
     """Status and body of an HTTP request (and lower-cased headers); HTTP errors are answers too."""
+    if not req.has_header("User-agent"):
+        req.add_header("User-Agent", USER_AGENT)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as res:
             status, text, headers = res.status, res.read().decode("utf-8", "replace"), res.headers
