@@ -385,6 +385,36 @@ class _Worker:
             self.sm.export(shapes, path)
         return {"ok": True, "path": path, "bytes": os.path.getsize(path), "shapes": [n for n, _ in items]}
 
+    def op_plan(self, z: float, path_dxf: str, path_png: str, names: list[str] | None = None,
+                size: tuple[int, int] = (1400, 1050)) -> dict[str, Any]:
+        """A floor-plan cut at height ``z``: the sections of the shown parts as a DXF, and a top view
+        of everything below the cut (cut faces hatched, hidden lines dashed) as a PNG. Changes nothing."""
+        from smlibpy.render import render
+
+        items = self._items(names)
+        parts = [(n, s) for n, s, _ in _drawn(items, curves=False) if isinstance(s, self.sm.Part)]
+        # Shown 2D sketches (room names as Text(...), dimension marks) go onto the plan as they are.
+        notes = [(n, s) for n, s in items if isinstance(s, self.sm.Sketch)]
+        if not parts:
+            return {"ok": False, "error": "nothing to cut: no part is shown"}
+        plane = self.sm.Plane.XY.offset(float(z))
+        sections = []
+        for n, part in parts:
+            try:
+                sk = part.section(plane)
+            except Exception:  # a part entirely above or below the cut
+                continue
+            if sk is not None and len(sk.faces()):
+                sections.append(sk.named(n) if hasattr(sk, "named") else sk)
+        if not sections:
+            return {"ok": False, "error": f"the plane z = {z} does not cut any shown part"}
+        for path in (path_dxf, path_png):
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        self.sm.export_dxf(sections + [s.named(n) if hasattr(s, "named") else s for n, s in notes], path_dxf)
+        render(*[s for _, s in parts], *[s for _, s in notes], path=path_png, view="top", size=tuple(size), lines=True,
+               section={"origin": [0, 0, float(z)], "normal": [0, 0, 1]}, cap=True)
+        return {"ok": True, "dxf": path_dxf, "png": path_png, "parts": [n for n, _ in parts]}
+
     def op_load(self, path: str, name: str | None = None) -> dict[str, Any]:
         path = os.path.abspath(os.path.expanduser(path))
         obj = self.sm.load(path)

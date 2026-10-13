@@ -40,7 +40,8 @@ STATE_FILE = "session.json"
 UPLOAD_TIMEOUT = 120.0
 PLACE_TIMEOUT = 60.0
 MCP_PROTOCOL = "2025-03-26"
-MIME = {".glb": "model/gltf-binary", ".step": "model/step", ".stl": "model/stl", ".png": "image/png"}
+MIME = {".glb": "model/gltf-binary", ".step": "model/step", ".stl": "model/stl", ".png": "image/png",
+        ".dxf": "image/vnd.dxf"}
 
 
 def _send(req: urllib.request.Request, timeout: float, with_headers: bool = False) -> Any:
@@ -266,7 +267,8 @@ class Zopu:
         return stats
 
     async def publish(self, project_id: str | None = None, name: str | None = None,
-                      names: list[str] | None = None, shape_id: str | None = None) -> str:
+                      names: list[str] | None = None, shape_id: str | None = None,
+                      plan_z: float | None = None) -> str:
         import anyio
 
         b = dict(self.bound or {})
@@ -278,6 +280,7 @@ class Zopu:
         name = name or b.get("name") or "Part"
         names = names if names is not None else b.get("names")
         shape_id = shape_id or b.get("shape_id")
+        plan_z = plan_z if plan_z is not None else b.get("plan_z")
         version = int(b.get("version") or 0) + 1
 
         uid = self._uid()
@@ -298,6 +301,13 @@ class Zopu:
                                      path=f"{base}.png")
             if snap.get("ok"):
                 out["png"] = f"{base}.png"
+            if plan_z is not None:
+                plan = self.session.call("plan", 300.0, z=float(plan_z), path_dxf=f"{base}-plan.dxf",
+                                         path_png=f"{base}-plan.png", names=names)
+                if not plan.get("ok"):
+                    raise RuntimeError(f"floor plan at z = {plan_z} failed: {plan.get('error')}")
+                out["plan_dxf"] = plan["dxf"]
+                out["plan_png"] = plan["png"]
             return out
 
         files = await anyio.to_thread.run_sync(export)
@@ -309,6 +319,9 @@ class Zopu:
         args: dict[str, Any] = {"projectId": project_id, "name": name, "glbUrl": urls["glb"],
                                 "stepUrl": urls.get("step", ""), "stlUrl": urls.get("stl", ""),
                                 "pngUrl": urls.get("png", ""), "stats": json.dumps(stats)}
+        if plan_z is not None:
+            args["dxfUrl"] = urls.get("plan_dxf", "")
+            args["planUrl"] = urls.get("plan_png", "")
         if shape_id:
             args["shapeId"] = shape_id
         try:
@@ -327,14 +340,16 @@ class Zopu:
             version = int(m.group(1))
 
         self.bound = {"project_id": project_id, "shape_id": shape_id, "name": name, "names": names,
-                      "version": version, "urls": urls, "stats": stats}
+                      "plan_z": plan_z, "version": version, "urls": urls, "stats": stats}
         self.save_state()
         size = " × ".join(f"{v:g}" for v in stats.get("bbox", [])) or "?"
         return (f"Published {name!r} v{version} to the canvas (shape {shape_id}).\n"
                 f"  size:   {size} mm\n  volume: {stats.get('volume', 0) / 1000:.3g} cm³\n"
                 f"  valid:  {stats.get('valid')}\n"
                 f"  STEP:   {urls.get('step', '')}\n  STL:    {urls.get('stl', '')}\n  GLB:    {urls['glb']}\n"
-                "Later successful scripts publish this part again automatically (unbind() to stop).")
+                + (f"  PLAN:   {urls.get('plan_png', '')} (cut at z = {plan_z:g} mm)\n"
+                   f"  DXF:    {urls.get('plan_dxf', '')}\n" if plan_z is not None else "")
+                + "Later successful scripts publish this part again automatically (unbind() to stop).")
 
     async def after_run(self) -> str | None:
         """After a successful script: publish the bound part again."""
@@ -355,6 +370,10 @@ class Zopu:
         return f"Stopped publishing {was.get('name')!r} (shape {was.get('shape_id')}); it stays on the canvas."
 
 
+VIEWER_NOTE = ("VIEWER: the user's Zopu canvas is the viewer. publish puts the model there and later scripts "
+               "update it. There is no local viewer: never give the user a localhost or 127.0.0.1 link.")
+
+
 GUIDE = """
 ZOPU CANVAS
 You work for a Zopu user; the part you build is the deliverable on their project canvas.
@@ -362,6 +381,8 @@ You work for a Zopu user; the part you build is the deliverable on their project
 cad_model shape on the canvas: a live 3D view with downloads. Publish once the first valid body exists.
 - After that every successful run_script publishes the part again (same shape, next version), so the \
 user watches it evolve. show(...) the deliverable so helpers and tools are left out.
+- Buildings and layouts: publish(..., plan_z=1200) also cuts a floor plan at that height (DXF + hatched plan \
+picture) shown on the same shape; later updates keep cutting it.
 - To change a part already on the canvas, pass its shape_id to publish. To start a different part, \
 unbind() first, then publish it under its own name.
 - The session is kept on disk: it survives the machine sleeping.

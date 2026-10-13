@@ -124,7 +124,8 @@ GUIDES
 
 
 def instructions() -> str:
-    text = _GUIDE.format(viewer=_VIEWER_NOTE[_mode()], methods=discovery.method_index(),
+    viewer = zopu.VIEWER_NOTE if zopu.enabled() else _VIEWER_NOTE[_mode()]
+    text = _GUIDE.format(viewer=viewer, methods=discovery.method_index(),
                          guides=discovery.guide_index() or "(none yet)")
     return text + zopu.GUIDE if zopu.enabled() else text
 
@@ -476,7 +477,6 @@ def build_server(session: Session | None = None) -> Any:
         await call(session.clear)
         return "The session is empty."
 
-    @tool()
     async def view(open: Annotated[bool, Field(description="Also open it in the user's default browser.")] = False) -> str:
         """The link of the live 3D viewer."""
         link = viewer.url
@@ -488,6 +488,9 @@ def build_server(session: Session | None = None) -> Any:
                 pass
         return f"Viewer: {link}"
 
+    if z is None:  # on Zopu the canvas is the viewer
+        tool()(view)
+
     if z is not None:
         @tool()
         async def publish(
@@ -497,11 +500,14 @@ def build_server(session: Session | None = None) -> Any:
             names: Annotated[list[str] | None, Field(description="Variables to publish instead of what is shown.")] = None,
             shape_id: Annotated[str | None, Field(description="An existing cad_model shape to update instead of "
                                                   "placing a new one.")] = None,
+            plan_z: Annotated[float | None, Field(description="For buildings and layouts: the height (mm) of a "
+                                                  "horizontal cut, e.g. 1200. Adds a 2D floor plan (DXF + hatched "
+                                                  "plan picture) to the shape.")] = None,
         ) -> str:
             """Put the model on the user's Zopu canvas: GLB, STEP, STL and a picture, as a live cad_model shape.
             Binds the part: later successful scripts update the same shape."""
             try:
-                return await z.publish(project_id, name, names, shape_id)
+                return await z.publish(project_id, name, names, shape_id, plan_z)
             except Exception as e:
                 return f"Publish failed: {e}"
 
