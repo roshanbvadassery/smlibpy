@@ -139,12 +139,21 @@ class Zopu:
         uid = os.environ.get("ZOPU_UID", "").strip()
         if uid:
             return uid
+        return str(self._session_file().get("uid") or "")
+
+    def _session_file(self) -> dict[str, Any]:
         ws = os.environ.get("ZOPU_WS") or os.getcwd()
         try:
             with open(os.path.join(ws, ".session.json"), encoding="utf-8") as f:
-                return str(json.load(f).get("uid") or "")
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
-            return ""
+            return {}
+
+    def _token(self) -> str:
+        """The owner's Firebase refresh token: from the environment, else the one the agent keeps in
+        the workspace's .session.json (it rotates independently of the machine env)."""
+        return self.mcp_token or str(self._session_file().get("refreshToken") or "").strip()
 
     def _upload(self, path: str, uid: str) -> str:
         ext = os.path.splitext(path)[1].lower()
@@ -181,8 +190,9 @@ class Zopu:
             msg["id"] = rid
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
                    "MCP-Protocol-Version": MCP_PROTOCOL}
-        if self.mcp_token:
-            headers["Authorization"] = f"Bearer {self.mcp_token}"
+        token = self._token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         if sid:
             headers["Mcp-Session-Id"] = sid
         req = urllib.request.Request(self.mcp_url, data=json.dumps(msg).encode(), method="POST", headers=headers)
