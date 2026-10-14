@@ -483,7 +483,7 @@ class Zopu:
 
     async def publish(self, project_id: str | None = None, name: str | None = None,
                       names: list[str] | None = None, shape_id: str | None = None,
-                      plan_z: float | None = None) -> str:
+                      plan_z: float | None = None, levels: list[dict] | None = None) -> str:
         import anyio
 
         if not self.part_id or not self.bound:
@@ -503,6 +503,10 @@ class Zopu:
         names = names if names is not None else b.get("names")
         shape_id = shape_id or b.get("shape_id")
         plan_z = plan_z if plan_z is not None else b.get("plan_z")
+        levels = levels if levels is not None else b.get("levels")
+        for lv in levels or []:
+            if not lv.get("name") or lv.get("z") is None:
+                raise ValueError("each level needs a name and a cut height z (mm), e.g. {'name': 'GF', 'z': 1200}")
         version = int(b.get("version") or 0) + 1
 
         uid = self._uid()
@@ -530,6 +534,14 @@ class Zopu:
                     raise RuntimeError(f"floor plan at z = {plan_z} failed: {plan.get('error')}")
                 out["plan_dxf"] = plan["dxf"]
                 out["plan_png"] = plan["png"]
+            for i, lv in enumerate(levels or []):
+                tag = _slug(str(lv["name"]))
+                plan = self.session.call("plan", 300.0, z=float(lv["z"]), path_dxf=f"{base}-{tag}.dxf",
+                                         path_png=f"{base}-{tag}.png", names=lv.get("names") or names)
+                if not plan.get("ok"):
+                    raise RuntimeError(f"level {lv['name']} plan at z = {lv['z']} failed: {plan.get('error')}")
+                out[f"level{i}_dxf"] = plan["dxf"]
+                out[f"level{i}_png"] = plan["png"]
             return out
 
         files = await anyio.to_thread.run_sync(export)
@@ -544,6 +556,9 @@ class Zopu:
         if plan_z is not None:
             args["dxfUrl"] = urls.get("plan_dxf", "")
             args["planUrl"] = urls.get("plan_png", "")
+        if levels:
+            args["levels"] = json.dumps([{"name": lv["name"], "z": lv["z"], "planUrl": urls.get(f"level{i}_png", ""),
+                                          "dxfUrl": urls.get(f"level{i}_dxf", "")} for i, lv in enumerate(levels)])
         if shape_id:
             args["shapeId"] = shape_id
         try:
@@ -562,7 +577,7 @@ class Zopu:
             version = int(m.group(1))
 
         self.bound = {**b, "project_id": project_id, "shape_id": shape_id, "name": name, "names": names,
-                      "plan_z": plan_z, "version": version, "urls": urls, "stats": stats}
+                      "plan_z": plan_z, "levels": levels, "version": version, "urls": urls, "stats": stats}
         self.save_state()
         size = " × ".join(f"{v:g}" for v in stats.get("bbox", [])) or "?"
         return (f"Published {name!r} v{version} to the canvas (shape {shape_id}).\n"
@@ -571,6 +586,8 @@ class Zopu:
                 f"  STEP:   {urls.get('step', '')}\n  STL:    {urls.get('stl', '')}\n  GLB:    {urls['glb']}\n"
                 + (f"  PLAN:   {urls.get('plan_png', '')} (cut at z = {plan_z:g} mm)\n"
                    f"  DXF:    {urls.get('plan_dxf', '')}\n" if plan_z is not None else "")
+                + "".join(f"  LEVEL {lv['name']}: plan {urls.get(f'level{i}_png', '')} · DXF {urls.get(f'level{i}_dxf', '')}\n"
+                          for i, lv in enumerate(levels or []))
                 + "Later successful scripts publish this part again automatically.")
 
     async def after_run(self) -> str | None:
@@ -611,6 +628,9 @@ replays its scripts; then modify it.
 - publish() exports what is shown (GLB, STEP, STL, a picture), uploads it and places the part's cad_model \
 shape on the canvas. Publish once the first valid body exists. After that every successful run_script \
 publishes again (same shape, next version), so the user watches it evolve. show(...) the deliverable.
+- Multi-floor buildings: publish(levels=[{"name": "GF", "z": 1200}, {"name": "FF", "z": 4500, "names": [...]}]) \
+cuts one plan per level (z = the cut height in that level; names = that level's bodies) — one Building shape \
+with a level switcher on the canvas.
 - Buildings and layouts: publish(plan_z=1200) also cuts a floor plan at that height (DXF + hatched plan \
 picture) on the same shape; later updates keep cutting it.
 - publish refuses another project, name or shape than the open part's: that is a new part (new_part).

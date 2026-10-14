@@ -515,11 +515,15 @@ def build_server(session: Session | None = None) -> Any:
             plan_z: Annotated[float | None, Field(description="For buildings and layouts: the height (mm) of a "
                                                   "horizontal cut, e.g. 1200. Adds a 2D floor plan (DXF + hatched "
                                                   "plan picture) to the shape.")] = None,
+            levels: Annotated[list[dict[str, Any]] | None, Field(description="Multi-floor buildings: one plan per "
+                                                  "level, e.g. [{\"name\": \"GF\", \"z\": 1200}, {\"name\": \"FF\", "
+                                                  "\"z\": 4500, \"names\": [\"ff_walls\"]}] (z = cut height, names = that "
+                                                  "level's bodies). The canvas shape gets a level switcher.")] = None,
         ) -> str:
             """Put the model on the user's Zopu canvas: GLB, STEP, STL and a picture, as a live cad_model shape.
             Binds the part: later successful scripts update the same shape."""
             try:
-                return await z.publish(project_id, name, names, shape_id, plan_z)
+                return await z.publish(project_id, name, names, shape_id, plan_z, levels)
             except Exception as e:
                 return f"Publish failed: {e}"
 
