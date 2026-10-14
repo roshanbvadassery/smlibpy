@@ -34,6 +34,7 @@ from .live import LiveViewer
 from .session import DEFAULT_TIMEOUT, Session
 
 DOCS_BUDGET = 48_000
+DOCS_BUDGET_ZOPU = 16_000  # docs replies stay in an agent's context for the rest of the run
 _counter = itertools.count(1)
 
 
@@ -124,10 +125,15 @@ GUIDES
 
 
 def instructions() -> str:
-    viewer = zopu.VIEWER_NOTE if zopu.enabled() else _VIEWER_NOTE[_mode()]
-    text = _GUIDE.format(viewer=viewer, methods=discovery.method_index(),
+    if zopu.enabled():
+        # Agent loops resend these instructions on every model call: keep them lean.
+        # The full method index and the ClassCAD pointer stay out; list_methods(search=...)
+        # and describe_method find anything on demand.
+        text = _GUIDE.split("SMLIBPY OR CLASSCAD")[0].format(viewer=zopu.VIEWER_NOTE)
+        return (text + "METHODS\nUse list_methods(search=\"what you want to do\") and describe_method(name); "
+                "never guess an API.\n\nGUIDES\n" + (discovery.guide_index() or "(none yet)") + "\n" + zopu.GUIDE)
+    return _GUIDE.format(viewer=_VIEWER_NOTE[_mode()], methods=discovery.method_index(),
                          guides=discovery.guide_index() or "(none yet)")
-    return text + zopu.GUIDE if zopu.enabled() else text
 
 
 def _snapshot_dir() -> str:
@@ -416,6 +422,7 @@ def build_server(session: Session | None = None) -> Any:
     ) -> str:
         """Read guides of the smlibpy skill."""
         out, used = [], 0
+        budget = DOCS_BUDGET_ZOPU if z is not None else DOCS_BUDGET
         for k in keys:
             g = discovery.guide(k)
             if g is None:
@@ -423,7 +430,9 @@ def build_server(session: Session | None = None) -> Any:
                 out.append(f"--- {k}: not found. Close: {', '.join(h.key for _, h in hits)}")
                 continue
             piece = f"--- {g.key} ---\n{g.text}"
-            if used + len(piece) > DOCS_BUDGET:
+            if not used and len(piece) > budget:  # one oversized guide: give its head, never nothing
+                piece = piece[:budget] + "\n… (guide truncated — use describe_method for specific functions)"
+            if used + len(piece) > budget:
                 out.append(f"--- {g.key}: left out (the answer is full); ask for it again on its own.")
                 continue
             used += len(piece)
