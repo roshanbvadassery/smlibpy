@@ -93,6 +93,9 @@ class Zopu:
         self.notice: str | None = None  # told once, with the next tool answer
         self._io = threading.Lock()
         self._restoring = False
+        # the part that was open at start: replayed on first use, not at boot
+        self._pending: dict[str, Any] | None = None
+        self._pending_lock = threading.Lock()
 
     # -- parts on disk ----------------------------------------------------------------
     @property
@@ -195,7 +198,7 @@ class Zopu:
 
     def save_state(self) -> None:
         """Called after every change of the session (Session.on_change): keeps the open part."""
-        if self._restoring or not self.part_id:
+        if self._restoring or self._pending is not None or not self.part_id:
             return
         if self.bound is not None:
             self.bound["updated"] = time.time()
@@ -270,6 +273,10 @@ class Zopu:
         if not key:
             if not self.part_id:
                 raise KeyError("no part is open")
+            pending = self._pending
+            if pending is not None:
+                hist = [(h["code"], h.get("label")) for h in pending.get("history", []) if h.get("code")]
+                return self._source_text(hist, self.bound, self.part_id)
             return self._source_text(self.session.history, self.bound, self.part_id)
         for pid, data in self._all_parts():
             b = data.get("bound") or {}
@@ -338,7 +345,14 @@ class Zopu:
             self.notice = (f"Note: the session still holds part {b.get('name')!r} (shape {shape}, "
                            f"v{b.get('version') or 0}, last edited {age / 60:.0f} min ago). For a different "
                            "design call new_part first; to keep editing it, go on.")
-        self._replay(data, background=True)
+        self._pending = data  # replayed by ensure_restored() when a tool needs the model
+
+    def ensure_restored(self) -> None:
+        """Replay the part that was open at start, before the first tool that needs its model."""
+        with self._pending_lock:
+            data, self._pending = self._pending, None
+            if data is not None:
+                self._replay(data, background=False)
 
     def take_notice(self) -> str | None:
         note, self.notice = self.notice, None
@@ -349,6 +363,7 @@ class Zopu:
     def new_part(self, project_id: str, name: str) -> str:
         if not project_id or not name:
             raise ValueError("new_part needs project_id and name")
+        self._pending = None
         previous = self.bound
         part_id = f"{_slug(name)}-{uuid.uuid4().hex[:6]}"
         now = time.time()
@@ -403,7 +418,8 @@ class Zopu:
             raise KeyError(f"no part {key!r}. list_parts() shows them; for a part made elsewhere, new_part and "
                            "rebuild it, then publish(shape_id=...) to update its shape.")
         pid, data = found
-        self.save_state()
+        self.save_state()  # skipped while the open part was never replayed
+        self._pending = None
         self.bound = data.get("bound")
         self._set_current(pid)
         self.notice = None
@@ -679,7 +695,8 @@ class Zopu:
     def unbind(self) -> str:
         """Close the open part: it stays on disk and on the canvas; scripts no longer update it."""
         was = self.bound
-        self.save_state()
+        self.save_state()  # skipped while the open part was never replayed
+        self._pending = None
         self.bound = None
         self._set_current(None)
         if not was:

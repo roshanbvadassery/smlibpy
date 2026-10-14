@@ -192,6 +192,8 @@ def build_server(session: Session | None = None) -> Any:
             return server.tool()
 
     async def call(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        if z is not None and fn not in (z.new_part, z.open_part, z.source):
+            await anyio.to_thread.run_sync(z.ensure_restored)
         return await anyio.to_thread.run_sync(lambda: fn(*args, **kwargs))
 
     def viewer_note(scene: list[dict[str, Any]]) -> str | None:
@@ -523,6 +525,7 @@ def build_server(session: Session | None = None) -> Any:
             """Put the model on the user's Zopu canvas: GLB, STEP, STL and a picture, as a live cad_model shape.
             Binds the part: later successful scripts update the same shape."""
             try:
+                await anyio.to_thread.run_sync(z.ensure_restored)
                 return await z.publish(project_id, name, names, shape_id, plan_z, levels)
             except Exception as e:
                 return f"Publish failed: {e}"
