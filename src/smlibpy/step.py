@@ -295,9 +295,16 @@ class _BodyWriter:
             return bool(use["same"])
         kf = self.kfaces[idx]
         kind = normal_fn[0]
-        p = np.array(kf.interior_point())
-        _, uvs, _ = k.surface_closest_point(kf.surface(), tuple(p))
-        u, v = uvs[0].x, uvs[0].y
+        try:
+            p = np.array(kf.interior_point())
+            _, uvs, _ = k.surface_closest_point(kf.surface(), tuple(p))
+            u, v = uvs[0].x, uvs[0].y
+        except Exception:
+            # The kernel finds no interior point on some faces (slivers, faces with many holes).
+            # These analytic surfaces have one sense everywhere, so any point of the surface will do.
+            (u0, v0), (u1, v1) = kf.uv_domain()
+            u, v = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+            p = np.array(kf.point_at_uv(u, v))
         if kind in ("cone", "torus"):
             o, z = normal_fn[1], normal_fn[2]
             d = p - o
