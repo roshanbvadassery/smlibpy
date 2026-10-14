@@ -42,6 +42,7 @@ from .session import Session
 STATE_FILE = "session.json"
 CURRENT_FILE = "current.json"
 STALE_AFTER_S = 30 * 60
+LOCK_FRESH_S = 120  # a part lock older than this is stale (its machine went away)
 OPEN_SOURCE_LINES = 120
 UPLOAD_TIMEOUT = 120.0
 PLACE_TIMEOUT = 60.0
@@ -124,9 +125,74 @@ class Zopu:
         except (OSError, ValueError):
             return {}
 
+    # -- per-machine pointer, part locks and the job inbox ----------------------------------
+    @property
+    def tag(self) -> str:
+        """Which machine/process this is: '' on the main machine, the machine id on a worker."""
+        return os.environ.get("SMLIBPY_PROCESS_TAG", "").strip()
+
+    @property
+    def _current_path(self) -> str:
+        name = f"current-{self.tag}.json" if self.tag else CURRENT_FILE
+        return os.path.join(self.state_dir, name)
+
+    def _lock_path(self, part_id: str) -> str:
+        return os.path.join(self.parts_dir, part_id, "lock.json")
+
+    def _check_lock(self, part_id: str) -> None:
+        lock = self._read_json(self._lock_path(part_id))
+        owner, at = lock.get("tag", ""), float(lock.get("at") or 0)
+        if owner != self.tag and time.time() - at < LOCK_FRESH_S:
+            where = owner or "the main machine"
+            raise RuntimeError(f"part {part_id} is being edited on {where} right now — wait for that job, or "
+                               "work on another part")
+
+    def _touch_lock(self, part_id: str | None) -> None:
+        if part_id:
+            self._write_json(self._lock_path(part_id), {"tag": self.tag, "at": time.time()})
+
+    def _release_lock(self, part_id: str | None) -> None:
+        if part_id and self._read_json(self._lock_path(part_id)).get("tag", "") == self.tag:
+            try:
+                os.remove(self._lock_path(part_id))
+            except OSError:
+                pass
+
     def _set_current(self, part_id: str | None) -> None:
+        if part_id:
+            self._check_lock(part_id)
+        if self.part_id and self.part_id != part_id:
+            self._release_lock(self.part_id)
         self.part_id = part_id
-        self._write_json(os.path.join(self.state_dir, CURRENT_FILE), {"part": part_id})
+        self._touch_lock(part_id)
+        self._write_json(self._current_path, {"part": part_id})
+
+    def inbox_notes(self) -> str | None:
+        """Messages the copilot sent to the job running here, delivered at this step boundary."""
+        ws = os.environ.get("ZOPU_WS") or os.path.dirname(self.cad_dir)
+        active = self._read_json(os.path.join(ws, "jobs", f"active-{self.tag or 'main'}.json"))
+        job = active.get("job")
+        if not job:
+            return None
+        jdir = os.path.join(ws, "jobs", job)
+        try:
+            with open(os.path.join(jdir, "inbox.jsonl"), encoding="utf-8") as f:
+                lines = [l for l in f.read().split("\n") if l.strip()]
+        except OSError:
+            return None
+        done = int(self._read_json(os.path.join(jdir, "inbox.consumed.json")).get("n") or 0)
+        fresh = lines[done:]
+        if not fresh:
+            return None
+        self._write_json(os.path.join(jdir, "inbox.consumed.json"), {"n": len(lines)})
+        notes = []
+        for l in fresh:
+            try:
+                m = json.loads(l)
+            except ValueError:
+                m = {"text": l}
+            notes.append(f"📨 From the {m.get('from') or 'copilot'}: {m.get('text', '')}")
+        return "\n".join(notes) + "\n— take this into account from this step on."
 
     def save_state(self) -> None:
         """Called after every change of the session (Session.on_change): keeps the open part."""
@@ -141,6 +207,7 @@ class Zopu:
             "saved": time.time(),
         })
         self._write_source(self.part_id, self.session.history, self.bound)
+        self._touch_lock(self.part_id)
 
     # -- the part's visible source (cad/parts/<id>/model.py) ------------------------------
     @property
@@ -250,7 +317,7 @@ class Zopu:
     def restore_state(self) -> None:
         """At start: reopen the part that was open (replayed in the background)."""
         self._migrate_flat_state()
-        part_id = self._read_json(os.path.join(self.state_dir, CURRENT_FILE)).get("part")
+        part_id = self._read_json(self._current_path).get("part")
         if not part_id:
             return
         data = self._read_json(self._part_file(part_id))
@@ -269,7 +336,8 @@ class Zopu:
 
     def take_notice(self) -> str | None:
         note, self.notice = self.notice, None
-        return note
+        inbox = self.inbox_notes()
+        return "\n\n".join(x for x in (inbox, note) if x) or None
 
     # -- the part lifecycle -----------------------------------------------------------
     def new_part(self, project_id: str, name: str) -> str:
