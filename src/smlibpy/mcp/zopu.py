@@ -42,6 +42,7 @@ from .session import Session
 STATE_FILE = "session.json"
 CURRENT_FILE = "current.json"
 STALE_AFTER_S = 30 * 60
+OPEN_SOURCE_LINES = 120
 UPLOAD_TIMEOUT = 120.0
 PLACE_TIMEOUT = 60.0
 MCP_PROTOCOL = "2025-03-26"
@@ -139,6 +140,70 @@ class Zopu:
             "bound": self.bound,
             "saved": time.time(),
         })
+        self._write_source(self.part_id, self.session.history, self.bound)
+
+    # -- the part's visible source (cad/parts/<id>/model.py) ------------------------------
+    @property
+    def cad_dir(self) -> str:
+        return os.path.dirname(self.state_dir)  # $WS/cad
+
+    def _source_path(self, part_id: str) -> str:
+        return os.path.join(self.cad_dir, "parts", part_id, "model.py")
+
+    def _spec_path(self, bound: dict[str, Any] | None) -> str | None:
+        b = bound or {}
+        if b.get("spec") and os.path.exists(os.path.join(os.path.dirname(self.cad_dir), b["spec"])):
+            return b["spec"]
+        specs = os.path.join(self.cad_dir, "specs")
+        slug = _slug(str(b.get("name") or ""))
+        try:
+            for f in sorted(os.listdir(specs)):
+                if slug and f.endswith(".json") and _slug(f[:-5]).startswith(slug[:24]):
+                    return f"cad/specs/{f}"
+        except OSError:
+            pass
+        return None
+
+    @staticmethod
+    def _source_text(history: list, bound: dict[str, Any] | None, part_id: str) -> str:
+        b = bound or {}
+        head = [f"# Part: {b.get('name') or part_id}  (id {part_id}, shape {b.get('shape_id') or '-'}, "
+                f"v{b.get('version') or 0}, project {b.get('project_id') or '-'})",
+                "# Generated from the modeling session: every successful step, in order. Edit by running",
+                "# new steps (or a build(spec) rebuild) — this file is a readable mirror, not executed directly.", ""]
+        body = []
+        for i, (code, label) in enumerate(history, 1):
+            body.append(f"# --- step {i}: {label or 'unlabelled'} ---")
+            body.append(code.rstrip())
+            body.append("")
+        return "\n".join(head + body)
+
+    def _write_source(self, part_id: str, history: list, bound: dict[str, Any] | None) -> None:
+        path = self._source_path(part_id)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self._source_text(history, bound, part_id))
+            b = bound or {}
+            spec = self._spec_path(bound)
+            with open(os.path.join(os.path.dirname(path), "README.md"), "w", encoding="utf-8") as f:
+                f.write(f"# {b.get('name') or part_id}\n\n- part id: `{part_id}`\n- canvas shape: `{b.get('shape_id') or '-'}` "
+                        f"(v{b.get('version') or 0})\n- project: `{b.get('project_id') or '-'}`\n"
+                        f"- spec: `{spec or 'none yet'}`\n- source: `cad/parts/{part_id}/model.py` ({len(history)} steps)\n")
+        except OSError:
+            pass
+
+    def source(self, key: str | None = None) -> str:
+        if not key:
+            if not self.part_id:
+                raise KeyError("no part is open")
+            return self._source_text(self.session.history, self.bound, self.part_id)
+        for pid, data in self._all_parts():
+            b = data.get("bound") or {}
+            if key in (pid, b.get("shape_id")) or key.lower() == str(b.get("name") or "").lower():
+                hist = [(h["code"], h.get("label")) for h in data.get("history", []) if h.get("code")]
+                return self._source_text(hist, b, pid)
+        raise KeyError(f"no part {key!r}")
 
     def _replay(self, data: dict[str, Any], background: bool) -> None:
         history = [(h["code"], h.get("label")) for h in data.get("history", []) if h.get("code")]
@@ -270,8 +335,20 @@ class Zopu:
         self.notice = None
         self._replay(data, background=False)
         b = self.bound or {}
+        steps = [label or "unlabelled" for _, label in self.session.history]
+        spec = self._spec_path(b)
+        src = self._source_text(self.session.history, b, pid).splitlines()
+        head = "\n".join(src[:OPEN_SOURCE_LINES])
+        more = f"\n… ({len(src) - OPEN_SOURCE_LINES} more lines: smlib_source() for all)" if len(src) > OPEN_SOURCE_LINES else ""
+        try:
+            vars_ = self.session.call("vars").get("vars", [])
+            var_line = ", ".join(f"{v['name']} ({v['type']})" for v in vars_[:30]) or "(none)"
+        except Exception:
+            var_line = "(unavailable)"
         return (f"Opened part {b.get('name')!r} (shape {b.get('shape_id') or '-'}, v{b.get('version') or 0}): "
-                f"{len(self.session.history)} scripts replayed. Later successful scripts update its shape.")
+                f"{len(steps)} scripts replayed. Later successful scripts update its shape.\n"
+                f"SOURCE: cad/parts/{pid}/model.py   SPEC: {spec or 'none — derive cad/specs/<part>.json from the source before editing'}\n"
+                f"STEPS: {' | '.join(steps)}\nVARIABLES: {var_line}\n\n{head}{more}")
 
     # -- publishing -------------------------------------------------------------------
     def _uid(self) -> str:

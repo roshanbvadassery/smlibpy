@@ -554,6 +554,17 @@ def build_server(session: Session | None = None) -> Any:
                 return f"open_part failed: {e.args[0] if e.args else e}"
 
         @tool()
+        async def source(
+            key: Annotated[str | None, Field(description="A part's shape id, name or id; default: the open part.")] = None,
+        ) -> str:
+            """The part's full modeling source: every successful step in order (also on disk at
+            cad/parts/<id>/model.py). Read it before editing a part instead of searching the filesystem."""
+            try:
+                return await call(z.source, key)
+            except Exception as e:
+                return f"source failed: {e.args[0] if e.args else e}"
+
+        @tool()
         async def list_parts() -> str:
             """The parts kept on this machine (newest first): name, canvas shape, version, project, size."""
             return z.list_parts()
