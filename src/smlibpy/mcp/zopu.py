@@ -169,12 +169,11 @@ class Zopu:
 
     def inbox_notes(self) -> str | None:
         """Messages the copilot sent to the job running here, delivered at this step boundary."""
-        ws = os.environ.get("ZOPU_WS") or os.path.dirname(self.cad_dir)
-        active = self._read_json(os.path.join(ws, "jobs", f"active-{self.tag or 'main'}.json"))
+        active = self._read_json(os.path.join(self.jobs_dir, f"active-{self.tag or 'main'}.json"))
         job = active.get("job")
         if not job:
             return None
-        jdir = os.path.join(ws, "jobs", job)
+        jdir = os.path.join(self.jobs_dir, job)
         try:
             with open(os.path.join(jdir, "inbox.jsonl"), encoding="utf-8") as f:
                 lines = [l for l in f.read().split("\n") if l.strip()]
@@ -212,7 +211,14 @@ class Zopu:
     # -- the part's visible source (cad/parts/<id>/model.py) ------------------------------
     @property
     def cad_dir(self) -> str:
-        return os.path.dirname(self.state_dir)  # $WS/cad
+        """The workspace's cad/ folder (sources, specs, projects) — durable and shared, even when the
+        hot session state lives on fast local disk (SMLIBPY_STATE_DIR outside the workspace)."""
+        ws = os.environ.get("ZOPU_WS")
+        return os.path.join(ws, "cad") if ws else os.path.dirname(self.state_dir)
+
+    @property
+    def jobs_dir(self) -> str:
+        return os.environ.get("ZOPU_JOBS_DIR") or os.path.join(os.path.dirname(self.cad_dir), "jobs")
 
     def _source_path(self, part_id: str) -> str:
         return os.path.join(self.cad_dir, "parts", part_id, "model.py")
